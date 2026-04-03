@@ -15,11 +15,11 @@ class ComfortPredictor:
     """Loads and runs the trained comfort model for inference."""
 
     def __init__(self):
-        self._xgb_model = None
+        self._xgb_booster = None
         self._onnx_session = None
 
     def load(self, model_path: Optional[str] = None):
-        """Load the model — tries ONNX first, falls back to XGBoost JSON."""
+        """Load the model — tries ONNX first, falls back to XGBoost JSON via native Booster."""
         if model_path is None:
             model_path = settings.base_model_path
 
@@ -35,9 +35,9 @@ class ComfortPredictor:
                 pass
 
         if os.path.exists(json_path):
-            from xgboost import XGBRegressor
-            self._xgb_model = XGBRegressor()
-            self._xgb_model.load_model(json_path)
+            import xgboost as xgb
+            self._xgb_booster = xgb.Booster()
+            self._xgb_booster.load_model(json_path)
             return
 
         raise FileNotFoundError(
@@ -58,8 +58,10 @@ class ComfortPredictor:
             input_name = self._onnx_session.get_inputs()[0].name
             result = self._onnx_session.run(None, {input_name: x})
             score = float(result[0][0])
-        elif self._xgb_model is not None:
-            score = float(self._xgb_model.predict(x)[0])
+        elif self._xgb_booster is not None:
+            import xgboost as xgb
+            dmat = xgb.DMatrix(x)
+            score = float(self._xgb_booster.predict(dmat)[0])
         else:
             raise RuntimeError("Model not loaded. Call .load() first.")
 

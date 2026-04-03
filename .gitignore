@@ -7,5 +7,7 @@ dist/
 build/
 .env
 *.onnx
+*.pt
+models/users/
 venv/
 .venv/
