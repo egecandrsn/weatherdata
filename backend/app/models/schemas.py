@@ -126,6 +126,7 @@ class PredictResponse(BaseModel):
     confidence: float
     description: str
     hourly_forecast: list[HourlyForecast] = []
+    transition_alerts: list["TransitionAlertResponse"] = []
 
 
 class FeedbackResponse(BaseModel):
@@ -161,7 +162,23 @@ class PersonalityCard(BaseModel):
     sensitivity_profile: SensitivityProfile
 
 
+class TransitionAlertResponse(BaseModel):
+    time: str
+    message: str
+    from_label: str
+    to_label: str
+    clothing_change: Optional[str] = None
+
+
 class InsightsResponse(BaseModel):
     personality_card: Optional[PersonalityCard] = None
     accuracy_trend: list[float] = []
     discoveries: list[str] = []
+
+
+class ModelDeliveryResponse(BaseModel):
+    user_id: str
+    model_version: int
+    model_type: str  # "base" | "personalized"
+    cluster_id: Optional[int] = None
+    feedback_count: int = 0

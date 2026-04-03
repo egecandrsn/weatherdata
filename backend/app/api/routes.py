@@ -20,15 +20,24 @@ from app.models.schemas import (
     HourlyForecast,
     PersonalityCard,
     SensitivityProfile,
+    TransitionAlertResponse,
+    ModelDeliveryResponse,
 )
 from app.services.weather import fetch_current_weather, parse_current_conditions, parse_hourly_forecast
 from app.services.features import build_feature_vector, feature_vector_to_model_input
 from app.services.comfort import score_to_comfort_label, score_to_clothing_rec, generate_description
 from app.ml.inference import get_predictor
+from app.core.config import settings
 from app.ml.clustering import (
     assign_cluster,
     apply_cluster_adjustment,
     CLUSTER_PERSONALITIES,
+)
+from app.services.alerts import detect_transitions
+from app.services.retraining import (
+    should_retrain,
+    retrain_reward_model,
+    compute_user_sensitivity_profile,
 )
 
 router = APIRouter(prefix="/v1")
@@ -132,6 +141,23 @@ async def predict(req: PredictRequest):
             )
         )
 
+    # Detect transition alerts from hourly forecasts
+    forecast_dicts = [
+        {"time": hf.time.isoformat(), "comfort_score": hf.comfort_score}
+        for hf in hourly_forecasts
+    ]
+    raw_alerts = detect_transitions(forecast_dicts)
+    transition_alerts = [
+        TransitionAlertResponse(
+            time=a.time,
+            message=a.message,
+            from_label=a.from_label,
+            to_label=a.to_label,
+            clothing_change=a.clothing_change,
+        )
+        for a in raw_alerts
+    ]
+
     return PredictResponse(
         prediction_id=prediction_id,
         comfort_score=round(score, 3),
@@ -140,6 +166,7 @@ async def predict(req: PredictRequest):
         confidence=round(confidence, 3),
         description=description,
         hourly_forecast=hourly_forecasts,
+        transition_alerts=transition_alerts,
     )
 
 
@@ -176,9 +203,20 @@ async def submit_feedback(req: FeedbackRequest):
     total = user["feedback_count"]
 
     # Determine next model update
-    from app.core.config import settings
     remaining = settings.retrain_feedback_threshold - (total % settings.retrain_feedback_threshold)
-    next_update = f"After {remaining} more feedback(s)" if remaining > 0 else "Queued for next training cycle"
+    if remaining == settings.retrain_feedback_threshold:
+        remaining = 0
+
+    # Trigger retraining if threshold met
+    if should_retrain(user):
+        try:
+            _, metrics = retrain_reward_model(user_id, _feedbacks)
+            user["personal_model_ver"] = user.get("personal_model_ver", 0) + 1
+            next_update = f"Model updated to v{user['personal_model_ver']}"
+        except Exception:
+            next_update = f"After {remaining} more feedback(s)" if remaining > 0 else "Queued for next training cycle"
+    else:
+        next_update = f"After {remaining} more feedback(s)" if remaining > 0 else "Queued for next training cycle"
 
     return FeedbackResponse(
         received=True,
@@ -247,26 +285,43 @@ async def get_insights(user_id: str):
     personality = CLUSTER_PERSONALITIES.get(cluster_id, {})
     feedback_count = user.get("feedback_count", 0)
 
-    # Build personality card
+    # Compute real sensitivity profile from feedback
+    user_feedbacks = [f for f in _feedbacks if f["user_id"] == user_id]
+    sensitivity = compute_user_sensitivity_profile(user_feedbacks)
+
+    # Build personality card with real sensitivity data
     card = PersonalityCard(
         title=personality.get("title", "Weather Explorer"),
         description=personality.get("desc", "Still learning your weather personality..."),
-        sensitivity_profile=SensitivityProfile(),
+        sensitivity_profile=SensitivityProfile(**sensitivity),
     )
 
     # Build accuracy trend from feedback history
-    user_feedbacks = [f for f in _feedbacks if f["user_id"] == user_id]
     accuracy_trend = []
     for fb in user_feedbacks[-20:]:  # last 20
         error = abs(fb["predicted_score"] - fb["comfort_score"])
         accuracy_trend.append(round(1.0 - error, 3))
 
-    # Generate discoveries
+    # Generate discoveries based on sensitivity analysis
     discoveries = []
     if feedback_count >= 10:
         discoveries.append(
             f"Based on {feedback_count} data points, your model is becoming personalized."
         )
+        # Add sensitivity-based discoveries
+        if sensitivity["cold_sensitivity"] > 0.3:
+            discoveries.append(
+                "You consistently feel colder than average — you're cold-sensitive."
+            )
+        if sensitivity["pressure_sensitivity"] > 0.3:
+            discoveries.append(
+                "You seem sensitive to barometric pressure changes — "
+                "you might notice weather shifts before they happen."
+            )
+        if sensitivity["wind_sensitivity"] > 0.3:
+            discoveries.append(
+                "Wind affects your comfort more than most people."
+            )
     if feedback_count >= 20:
         avg_error = sum(
             abs(f["predicted_score"] - f["comfort_score"]) for f in user_feedbacks
@@ -279,4 +334,31 @@ async def get_insights(user_id: str):
         personality_card=card if feedback_count >= 3 else None,
         accuracy_trend=accuracy_trend,
         discoveries=discoveries,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GET /v1/model/{user_id}/latest
+# ---------------------------------------------------------------------------
+@router.get("/model/{user_id}/latest", response_model=ModelDeliveryResponse)
+async def get_latest_model(user_id: str):
+    """Get metadata about the latest model for a user.
+
+    In production, this would return a binary ONNX model file.
+    For now, returns model metadata for the client to determine
+    if it needs to update its on-device model.
+    """
+    user = _users.get(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    model_ver = user.get("personal_model_ver", 0)
+    model_type = "personalized" if model_ver > 0 else "base"
+
+    return ModelDeliveryResponse(
+        user_id=user_id,
+        model_version=model_ver,
+        model_type=model_type,
+        cluster_id=user.get("cluster_id"),
+        feedback_count=user.get("feedback_count", 0),
     )
